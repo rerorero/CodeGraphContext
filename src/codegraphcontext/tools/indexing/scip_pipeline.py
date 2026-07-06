@@ -69,6 +69,11 @@ async def run_scip_index_async(
         warning_logger(f"Could not load/create .cgcignore for SCIP indexing: {e}")
 
     def should_skip_file(file_path: Path) -> bool:
+        # SCIP indexes can reference files OUTSIDE the project root (e.g. Go build
+        # cache paths for cgo/generated code). Downstream writers call
+        # relative_to(repo) unconditionally and would crash the whole ingest.
+        if not file_path.is_relative_to(index_root):
+            return True
         if file_path.is_file() and file_path_has_ignore_dir_segment(file_path, index_root):
             return True
         if not ignore_spec:
@@ -96,7 +101,7 @@ async def run_scip_index_async(
             raise RuntimeError("SCIP parse returned empty result")
 
         files_data = scip_data.get("files", {})
-        if ignore_spec:
+        if True:  # always filter — out-of-root paths crash downstream writers
             files_data = {
                 abs_path_str: file_data
                 for abs_path_str, file_data in files_data.items()
