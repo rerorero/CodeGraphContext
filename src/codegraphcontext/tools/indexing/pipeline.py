@@ -102,18 +102,14 @@ async def run_tree_sitter_index_async(
         if processed_count % 50 == 0:
             info_logger(f"Processed {processed_count}/{len(files)} files...")
 
-    # Parsing remains concurrent, but graph writes are ordered so shared nodes
-    # such as imported modules receive deterministic canonical metadata.
+    # Parsing remains concurrent; writes go through one batched call, sorted so
+    # shared nodes such as imported modules receive deterministic canonical
+    # metadata.
+    parsed_file_data: List[Dict[str, Any]] = []
     for file_data in sorted(all_file_data, key=lambda data: str(data.get("path") or "")):
         repo_path = Path(file_data.pop("_index_repo_path"))
         if "error" not in file_data:
-            await asyncio.to_thread(
-                writer.add_file_to_graph,
-                file_data,
-                repo_name,
-                imports_map,
-                repo_path_str=resolved_repo_path_str,
-            )
+            parsed_file_data.append(file_data)
         elif not file_data.get("unsupported"):
             await asyncio.to_thread(
                 add_minimal_file_node,
@@ -121,6 +117,13 @@ async def run_tree_sitter_index_async(
                 repo_path,
                 is_dependency,
             )
+    await asyncio.to_thread(
+        writer.add_files_to_graph,
+        parsed_file_data,
+        repo_name,
+        imports_map,
+        resolved_repo_path_str,
+    )
 
     all_file_data = [file_data for file_data in all_file_data if "error" not in file_data]
 

@@ -115,6 +115,7 @@ async def run_scip_index_async(
             job_manager.update_job(job_id, total_files=len(files_data))
 
         processed = 0
+        pending_file_data = []
         for abs_path_str, file_data in files_data.items():
             file_path = Path(abs_path_str)
             if should_skip_file(file_path):
@@ -172,7 +173,7 @@ async def run_scip_index_async(
                 except Exception as e:
                     debug_log(f"Tree-sitter supplement failed for {abs_path_str}: {e}")
 
-            writer.add_file_to_graph(file_data, repo_name, imports_map)
+            pending_file_data.append(file_data)
 
             processed += 1
             if job_id:
@@ -180,12 +181,23 @@ async def run_scip_index_async(
             if processed % 50 == 0:
                 await asyncio.sleep(0)
 
+        if job_id:
+            job_manager.update_job(job_id, status_message="Writing file nodes to graph...")
+        await asyncio.to_thread(
+            writer.add_files_to_graph,
+            pending_file_data,
+            repo_name,
+            imports_map,
+            str(index_root),
+        )
+
         # ── Supplementary pass: Tree-sitter-only for files SCIP missed ───
         # Some SCIP indexers (e.g. scip-php with Composer classmap) only
         # index a subset of repo files. Discover remaining parseable files
         # and index them via Tree-sitter so the graph has full coverage.
         scip_abs_paths = set(files_data.keys())
         supplemented = 0
+        supplementary_file_data = []
         from .discovery import discover_files_to_index
         supplementary_files, _ = discover_files_to_index(
             index_root,
@@ -206,7 +218,7 @@ async def run_scip_index_async(
                 ts_data["repo_path"] = str(index_root)
                 ts_data.setdefault("function_calls_scip", [])
                 ts_data.setdefault("module_level_calls_scip", [])
-                writer.add_file_to_graph(ts_data, repo_name, imports_map)
+                supplementary_file_data.append(ts_data)
                 # Also include in files_data so inheritance/calls resolution sees them
                 files_data[abs_str] = ts_data
                 supplemented += 1
@@ -217,6 +229,14 @@ async def run_scip_index_async(
                     )
             except Exception as e:
                 debug_log(f"Tree-sitter supplement (non-SCIP file) failed for {abs_str}: {e}")
+        if supplementary_file_data:
+            await asyncio.to_thread(
+                writer.add_files_to_graph,
+                supplementary_file_data,
+                repo_name,
+                imports_map,
+                str(index_root),
+            )
         if supplemented:
             # Re-run pre_scan with the expanded file list so imports_map is complete
             all_paths = [Path(p) for p in files_data.keys() if Path(p).exists()]

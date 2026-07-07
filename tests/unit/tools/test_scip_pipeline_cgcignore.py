@@ -95,8 +95,9 @@ async def test_scip_pipeline_respects_root_directory_cgcignore_pattern(tmp_path:
         )
 
     indexed_paths = [
-        call.args[0]["path"]
-        for call in writer.add_file_to_graph.call_args_list
+        file_data["path"]
+        for call in writer.add_files_to_graph.call_args_list
+        for file_data in call.args[0]
     ]
     assert str(tracked_file.resolve()) in indexed_paths
     assert str(ignored_file.resolve()) not in indexed_paths

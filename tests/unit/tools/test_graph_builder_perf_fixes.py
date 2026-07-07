@@ -545,8 +545,8 @@ class TestAddFileToGraph:
         )
         assert "c.line_number = row.class_line" in class_fn_call["query"]
         assert class_fn_call["kwargs"]["batch"] == [
-            {"class_name": "Worker", "class_line": 2, "func_name": "run", "func_line": 3},
-            {"class_name": "Worker", "class_line": 7, "func_name": "run", "func_line": 8},
+            {"path": "/repo/A.kt", "class_name": "Worker", "class_line": 2, "func_name": "run", "func_line": 3},
+            {"path": "/repo/A.kt", "class_name": "Worker", "class_line": 7, "func_name": "run", "func_line": 8},
         ]
 
     def test_non_javascript_import_rows_are_schema_complete(self):
@@ -581,6 +581,7 @@ class TestAddFileToGraph:
         assert "m.alias" not in import_call["query"]
         assert import_call["kwargs"]["batch"] == [
             {
+                "path": "/repo/main.go",
                 "name": "fmt",
                 "full_import_name": "fmt",
                 "imported_name": "fmt",
