@@ -79,6 +79,283 @@ def _is_binder_exception(e: Exception) -> bool:
     return "binder" in err_str or "cannot find a valid label" in err_str
 
 
+def _iter_chunks(items: List[Any], size: int):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def _positive_int_config(key: str, default: int) -> int:
+    """Read a positive-integer setting (env var or cgc config); fall back on default."""
+    try:
+        from ....cli.config_manager import get_config_value
+
+        value = int(get_config_value(key) or default)
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _normalize_batch_types(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Coerce every column of an UNWIND batch to its dominant type.
+
+    Embedded backends require homogeneous property types across the rows of
+    a single UNWIND batch; mixed str/int/list columns are converted in place.
+    """
+    if not batch:
+        return batch
+
+    import json as _json
+
+    all_keys = set()
+    for b in batch:
+        all_keys.update(b.keys())
+
+    for k in all_keys:
+        counts: Dict[str, int] = {}
+        for b in batch:
+            v = b.get(k)
+            if v is not None:
+                tname = type(v).__name__
+                counts[tname] = counts.get(tname, 0) + 1
+
+        dominant = max(counts, key=counts.get) if counts else "str"
+
+        for b in batch:
+            v = b.get(k)
+            if dominant == "list":
+                if isinstance(v, list):
+                    b[k] = [str(x) for x in v] if v else [""]
+                elif isinstance(v, str) and v:
+                    try:
+                        p = _json.loads(v)
+                        b[k] = [str(x) for x in p] if isinstance(p, list) and p else [""]
+                    except Exception:
+                        b[k] = [v]
+                else:
+                    b[k] = [""]
+            elif dominant == "int":
+                if v is None or v == "":
+                    b[k] = 0
+                elif not isinstance(v, int):
+                    try:
+                        b[k] = int(v)
+                    except Exception:
+                        b[k] = 0
+            elif dominant == "bool":
+                b[k] = bool(v) if v is not None else False
+            else:
+                if v is None:
+                    b.pop(k, None)
+                elif isinstance(v, list):
+                    b[k] = _json.dumps(v)
+                elif not isinstance(v, str):
+                    b[k] = str(v)
+
+    key_order = sorted(all_keys)
+    batch[:] = [{k: b[k] for k in key_order if k in b} for b in batch]
+    return batch
+
+
+def _collect_file_group_rows(
+    group: List[Dict[str, Any]], resolved_repo_str: str, seen_dirs: set
+) -> Dict[str, Any]:
+    """Convert parsed file dicts into UNWIND-ready row lists.
+
+    ``seen_dirs`` is shared across groups so each Directory node and its
+    containment edge is emitted only once per indexing run.
+    """
+    rows: Dict[str, Any] = {
+        "files": [],
+        "dirs": [],
+        "repo_dir_edges": [],
+        "dir_dir_edges": [],
+        "repo_file_edges": [],
+        "dir_file_edges": [],
+        "entities": {},
+        "params": [],
+        "enum_members": [],
+        "class_fns": [],
+        "nested_fns": [],
+        "js_imports": [],
+        "other_imports": [],
+        "module_inclusions": [],
+    }
+
+    for file_data in group:
+        file_path_str = _normalize_path(file_data["path"])
+        file_name = Path(file_path_str).name
+        is_dependency = file_data.get("is_dependency", False)
+        lang = file_data.get("lang")
+
+        try:
+            relative_parts = Path(file_path_str).relative_to(Path(resolved_repo_str)).parts
+            relative_path = str(Path(*relative_parts))
+        except ValueError:
+            relative_parts = None
+            relative_path = file_name
+
+        rows["files"].append(
+            {
+                "path": file_path_str,
+                "name": file_name,
+                "relative_path": relative_path,
+                "is_dependency": is_dependency,
+            }
+        )
+
+        parent_path = resolved_repo_str
+        parent_label = "Repository"
+        if relative_parts:
+            for part in relative_parts[:-1]:
+                current_path_str = _normalize_path(Path(parent_path) / part)
+                if current_path_str not in seen_dirs:
+                    seen_dirs.add(current_path_str)
+                    rows["dirs"].append({"path": current_path_str, "name": part})
+                    edge = {"parent_path": parent_path, "child_path": current_path_str}
+                    if parent_label == "Repository":
+                        rows["repo_dir_edges"].append(edge)
+                    else:
+                        rows["dir_dir_edges"].append(edge)
+                parent_path = current_path_str
+                parent_label = "Directory"
+        file_edge = {"parent_path": parent_path, "child_path": file_path_str}
+        if parent_label == "Repository":
+            rows["repo_file_edges"].append(file_edge)
+        else:
+            rows["dir_file_edges"].append(file_edge)
+
+        item_mappings = [
+            (file_data.get("functions", []), "Function"),
+            (file_data.get("classes", []), "Class"),
+            (file_data.get("traits", []), "Trait"),
+            (file_data.get("variables", []), "Variable"),
+            (file_data.get("interfaces", []), "Interface"),
+            (file_data.get("macros", []), "Macro"),
+            (file_data.get("structs", []), "Struct"),
+            (file_data.get("enums", []), "Enum"),
+            (file_data.get("unions", []), "Union"),
+            (file_data.get("records", []), "Record"),
+            (file_data.get("properties", []), "Property"),
+            (file_data.get("mixins", []), "Mixin"),
+            (file_data.get("extensions", []), "Extension"),
+            (file_data.get("modules", []), "Module"),
+            (file_data.get("objects", []), "Object"),
+            (file_data.get("enum_members", []), "EnumMember"),
+        ]
+
+        for item_list, label in item_mappings:
+            if not item_list:
+                continue
+            file_label_rows: List[Dict[str, Any]] = []
+            for item in item_list:
+                row = dict(item)
+                row["path"] = file_path_str
+                if label == "Function" and "cyclomatic_complexity" not in row:
+                    row["cyclomatic_complexity"] = 1
+                file_label_rows.append(sanitize_props(row))
+                if label == "EnumMember":
+                    rows["enum_members"].append(
+                        {
+                            "path": file_path_str,
+                            "class_name": item.get("enum_name"),
+                            "class_line": item.get("enum_line_number", -1),
+                            "member_name": item["name"],
+                        }
+                    )
+                if label == "Function":
+                    for arg_name in item.get("args", []):
+                        rows["params"].append(
+                            {
+                                "path": file_path_str,
+                                "func_name": item["name"],
+                                "line_number": item["line_number"],
+                                "arg_name": arg_name,
+                            }
+                        )
+                    if item.get("class_context"):
+                        rows["class_fns"].append(
+                            {
+                                "path": file_path_str,
+                                "class_name": item["class_context"],
+                                "class_line": item.get("class_context_line", -1)
+                                if item.get("class_context_line") is not None
+                                else -1,
+                                "func_name": item["name"],
+                                "func_line": item["line_number"],
+                            }
+                        )
+                    if item.get("context_type") == "function_definition":
+                        outer_ctx = item.get("context")
+                        outer_name = (
+                            outer_ctx[0]
+                            if isinstance(outer_ctx, (tuple, list)) and outer_ctx
+                            else outer_ctx
+                        )
+                        rows["nested_fns"].append(
+                            {
+                                "path": file_path_str,
+                                "outer": outer_name,
+                                "inner_name": item["name"],
+                                "inner_line": item["line_number"],
+                            }
+                        )
+
+            # Property types are normalized per file so one file's type mix
+            # cannot change what another file's rows store.
+            rows["entities"].setdefault(label, []).extend(
+                _normalize_batch_types(file_label_rows)
+            )
+
+        for imp in file_data.get("imports", []):
+            if lang in {"javascript", "typescript", "tsx"}:
+                module_name = imp.get("source")
+                if module_name:
+                    rows["js_imports"].append(
+                        {
+                            "path": file_path_str,
+                            "module_name": module_name,
+                            "imported_name": imp.get("name", "*"),
+                            "alias": imp.get("alias") or "",
+                            "line_number": imp.get("line_number") or 0,
+                        }
+                    )
+            else:
+                module_name = (
+                    imp.get("name")
+                    or imp.get("source")
+                    or imp.get("full_import_name")
+                )
+                if not module_name:
+                    continue
+                full_import_name = (
+                    imp.get("full_import_name")
+                    or imp.get("source")
+                    or module_name
+                )
+                rows["other_imports"].append(
+                    {
+                        "path": file_path_str,
+                        "name": module_name,
+                        "full_import_name": full_import_name,
+                        "imported_name": imp.get("imported_name") or module_name,
+                        "alias": imp.get("alias"),
+                        "line_number": imp.get("line_number") or 0,
+                        "lang": imp.get("lang") or lang,
+                    }
+                )
+
+        for inclusion in file_data.get("module_inclusions", []):
+            rows["module_inclusions"].append(
+                {
+                    "path": file_path_str,
+                    "class_name": inclusion["class"],
+                    "module_name": inclusion["module"],
+                }
+            )
+
+    return rows
+
+
 
 class GraphWriter:
     """Persists repository/file/symbol nodes and relationships via the Neo4j-like driver API."""
@@ -204,361 +481,234 @@ class GraphWriter:
         imports_map: dict,
         repo_path_str: Optional[str] = None,
     ) -> None:
-        # Normalize: always store with forward slashes
-        file_path_str = _normalize_path(file_data["path"])
-        file_name = Path(file_path_str).name
-        is_dependency = file_data.get("is_dependency", False)
-        lang = file_data.get("lang")
+        self.add_files_to_graph([file_data], repo_name, imports_map, repo_path_str=repo_path_str)
+
+    def add_files_to_graph(
+        self,
+        files_data: List[Dict[str, Any]],
+        repo_name: str,
+        imports_map: dict,
+        repo_path_str: Optional[str] = None,
+    ) -> None:
+        """Write File/Directory/symbol nodes for many files with batched UNWIND queries.
+
+        Rows are accumulated across files and flushed per group, so the number
+        of DB round-trips scales with batch count instead of entity count.
+        """
+        if not files_data:
+            return
 
         backend = get_backend_type(self.driver, self._db_manager)
-        def _work(session):
-            if repo_path_str:
-                resolved_repo_str = _normalize_path(repo_path_str)
-            else:
-                repo_result = session.run(
-                    "MATCH (r:Repository {path: $repo_path}) RETURN r.path as path",
-                    repo_path=_normalize_path(file_data["repo_path"]),
-                ).single()
-                resolved_repo_str = (
-                    repo_result["path"] if repo_result else _normalize_path(file_data["repo_path"])
+        batch_size = _positive_int_config("WRITE_BATCH_SIZE", 1000)
+        file_group_size = _positive_int_config("WRITE_FILE_GROUP_SIZE", 200)
+
+        resolved_repo_str = self._resolve_repo_path(files_data[0], repo_path_str)
+
+        seen_dirs: set = set()
+        total = len(files_data)
+        written = 0
+        t0 = time.time()
+        for group in _iter_chunks(files_data, file_group_size):
+            rows = _collect_file_group_rows(group, resolved_repo_str, seen_dirs)
+
+            def _work(session, _rows=rows):
+                self._flush_file_rows(session, _rows, batch_size)
+
+            execute_write_operation(self.driver, backend, _work)
+            written += len(group)
+            if total > file_group_size:
+                info_logger(
+                    f"[FILES] {written}/{total} files written ({time.time() - t0:.1f}s elapsed)"
                 )
-                if not repo_result:
-                    warning_logger(
-                        f"Repository node not found for {file_data['repo_path']} during indexing of {file_name}."
-                    )
 
-            try:
-                relative_path = str(Path(file_path_str).relative_to(Path(resolved_repo_str)))
-            except ValueError:
-                relative_path = file_name
+    def _resolve_repo_path(self, file_data: Dict[str, Any], repo_path_str: Optional[str]) -> str:
+        if repo_path_str:
+            return _normalize_path(repo_path_str)
+        repo_path = _normalize_path(file_data["repo_path"])
+        backend = get_backend_type(self.driver, self._db_manager)
 
+        def _work(session):
+            result = session.run(
+                "MATCH (r:Repository {path: $repo_path}) RETURN r.path as path",
+                repo_path=repo_path,
+            ).single()
+            return result["path"] if result else None
+
+        resolved = execute_read_operation(self.driver, backend, _work)
+        if not resolved:
+            warning_logger(f"Repository node not found for {repo_path} during indexing.")
+            return repo_path
+        return resolved
+
+    def _flush_file_rows(self, session: Any, rows: Dict[str, Any], batch_size: int) -> None:
+        for chunk in _iter_chunks(rows["files"], batch_size):
             session.run(
                 """
-                MERGE (f:File {path: $path})
-                SET f.name = $name, f.relative_path = $relative_path, f.is_dependency = $is_dependency
+                UNWIND $batch AS row
+                MERGE (f:File {path: row.path})
+                SET f.name = row.name, f.relative_path = row.relative_path, f.is_dependency = row.is_dependency
             """,
-                path=file_path_str,
-                name=file_name,
-                relative_path=relative_path,
-                is_dependency=is_dependency,
+                batch=chunk,
             )
 
-            file_path_obj = Path(file_path_str)
-            repo_path_obj = Path(resolved_repo_str)
-            relative_path_to_file = file_path_obj.relative_to(repo_path_obj)
-            parent_path = resolved_repo_str
-            parent_label = "Repository"
-            for part in relative_path_to_file.parts[:-1]:
-                # Normalize directory paths too
-                current_path_str = _normalize_path(Path(parent_path) / part)
+        for chunk in _iter_chunks(rows["dirs"], batch_size):
+            session.run(
+                """
+                UNWIND $batch AS row
+                MERGE (d:Directory {path: row.path})
+                SET d.name = row.name
+            """,
+                batch=chunk,
+            )
+
+        for parent_label, key in (("Repository", "repo_dir_edges"), ("Directory", "dir_dir_edges")):
+            for chunk in _iter_chunks(rows[key], batch_size):
                 session.run(
                     f"""
-                    MATCH (p:`{parent_label}` {{path: $parent_path}})
-                    MERGE (d:Directory {{path: $current_path}})
-                    SET d.name = $part
+                    UNWIND $batch AS row
+                    MATCH (p:`{parent_label}` {{path: row.parent_path}})
+                    MATCH (d:Directory {{path: row.child_path}})
                     MERGE (p)-[:CONTAINS]->(d)
                 """,
-                    parent_path=parent_path,
-                    current_path=current_path_str,
-                    part=part,
+                    batch=chunk,
                 )
-                parent_path = current_path_str
-                parent_label = "Directory"
-            session.run(
-                f"""
-                MATCH (p:`{parent_label}` {{path: $parent_path}})
-                MATCH (f:File {{path: $path}})
-                MERGE (p)-[:CONTAINS]->(f)
-            """,
-                parent_path=parent_path,
-                path=file_path_str,
-            )
 
-            item_mappings = [
-                (file_data.get("functions", []), "Function"),
-                (file_data.get("classes", []), "Class"),
-                (file_data.get("traits", []), "Trait"),
-                (file_data.get("variables", []), "Variable"),
-                (file_data.get("interfaces", []), "Interface"),
-                (file_data.get("macros", []), "Macro"),
-                (file_data.get("structs", []), "Struct"),
-                (file_data.get("enums", []), "Enum"),
-                (file_data.get("unions", []), "Union"),
-                (file_data.get("records", []), "Record"),
-                (file_data.get("properties", []), "Property"),
-                (file_data.get("mixins", []), "Mixin"),
-                (file_data.get("extensions", []), "Extension"),
-                (file_data.get("modules", []), "Module"),
-                (file_data.get("objects", []), "Object"),
-                (file_data.get("enum_members", []), "EnumMember"),
-            ]
-
-            params_batch: List[Dict[str, Any]] = []
-            class_fn_batch: List[Dict[str, Any]] = []
-            enum_member_batch: List[Dict[str, Any]] = []
-            nested_fn_batch: List[Dict[str, Any]] = []
-
-            for item_list, label in item_mappings:
-                if not item_list:
-                    continue
-                batch: List[Dict[str, Any]] = []
-                for item in item_list:
-                    row = dict(item)
-                    row["path"] = file_path_str
-                    if label == "Function" and "cyclomatic_complexity" not in row:
-                        row["cyclomatic_complexity"] = 1
-                    batch.append(sanitize_props(row))
-                    if label == "EnumMember":
-                        enum_member_batch.append(
-                            {
-                                "class_name": item.get("enum_name"),
-                                "class_line": item.get("enum_line_number", -1),
-                                "member_name": item["name"],
-                            }
-                        )
-                    if label == "Function":
-                        for arg_name in item.get("args", []):
-                            params_batch.append(
-                                {
-                                    "func_name": item["name"],
-                                    "line_number": item["line_number"],
-                                    "arg_name": arg_name,
-                                }
-                            )
-                        if item.get("class_context"):
-                            class_fn_batch.append(
-                                {
-                                    "class_name": item["class_context"],
-                                    "class_line": item.get("class_context_line", -1)
-                                    if item.get("class_context_line") is not None
-                                    else -1,
-                                    "func_name": item["name"],
-                                    "func_line": item["line_number"],
-                                }
-                            )
-                        if item.get("context_type") == "function_definition":
-                            outer_ctx = item.get("context")
-                            outer_name = (
-                                outer_ctx[0]
-                                if isinstance(outer_ctx, (tuple, list)) and outer_ctx
-                                else outer_ctx
-                            )
-                            nested_fn_batch.append(
-                                {
-                                    "outer": outer_name,
-                                    "inner_name": item["name"],
-                                    "inner_line": item["line_number"],
-                                }
-                            )
-
-                if batch:
-                    import json as _json
-
-                    all_keys = set()
-                    for b in batch:
-                        all_keys.update(b.keys())
-
-                    for k in all_keys:
-                        counts: Dict[str, int] = {}
-                        for b in batch:
-                            v = b.get(k)
-                            if v is not None:
-                                tname = type(v).__name__
-                                counts[tname] = counts.get(tname, 0) + 1
-
-                        dominant = max(counts, key=counts.get) if counts else "str"
-
-                        for b in batch:
-                            v = b.get(k)
-                            if dominant == "list":
-                                if isinstance(v, list):
-                                    b[k] = [str(x) for x in v] if v else [""]
-                                elif isinstance(v, str) and v:
-                                    try:
-                                        p = _json.loads(v)
-                                        b[k] = [str(x) for x in p] if isinstance(p, list) and p else [""]
-                                    except Exception:
-                                        b[k] = [v]
-                                else:
-                                    b[k] = [""]
-                            elif dominant == "int":
-                                if v is None or v == "":
-                                    b[k] = 0
-                                elif not isinstance(v, int):
-                                    try:
-                                        b[k] = int(v)
-                                    except Exception:
-                                        b[k] = 0
-                            elif dominant == "bool":
-                                b[k] = bool(v) if v is not None else False
-                            else:
-                                if v is None:
-                                    b.pop(k, None)
-                                elif isinstance(v, list):
-                                    b[k] = _json.dumps(v)
-                                elif not isinstance(v, str):
-                                    b[k] = str(v)
-
-                    key_order = sorted(all_keys)
-                    batch[:] = [{k: b[k] for k in key_order if k in b} for b in batch]
-
-                if label in {"Module", "DbTable", "ExternalClass"}:
-                    merge_clause = f"MERGE (n:{label} {{name: row.name}})"
-                    match_clause = f"MATCH (n:{label} {{name: row.name}})"
-                else:
-                    merge_clause = f"MERGE (n:{label} {{name: row.name, path: $file_path, line_number: row.line_number}})"
-                    match_clause = f"MATCH (n:{label} {{name: row.name, path: $file_path, line_number: row.line_number}})"
-
+        for parent_label, key in (("Repository", "repo_file_edges"), ("Directory", "dir_file_edges")):
+            for chunk in _iter_chunks(rows[key], batch_size):
                 session.run(
                     f"""
                     UNWIND $batch AS row
-                    {merge_clause}
-                    SET n += row
+                    MATCH (p:`{parent_label}` {{path: row.parent_path}})
+                    MATCH (f:File {{path: row.child_path}})
+                    MERGE (p)-[:CONTAINS]->(f)
                 """,
-                    batch=batch,
-                    file_path=file_path_str,
-                )
-                session.run(
-                    f"""
-                    UNWIND $batch AS row
-                    MATCH (f:File {{path: $file_path}})
-                    {match_clause}
-                    MERGE (f)-[:CONTAINS]->(n)
-                """,
-                    batch=batch,
-                    file_path=file_path_str,
+                    batch=chunk,
                 )
 
-            if params_batch:
-                seen_params: set = set()
-                unique_params: List[Dict[str, Any]] = []
-                for p in params_batch:
-                    key = (p["func_name"], p["line_number"], p["arg_name"])
-                    if key not in seen_params:
-                        seen_params.add(key)
-                        unique_params.append(p)
+        for label, entity_rows in rows["entities"].items():
+            if label in {"Module", "DbTable", "ExternalClass"}:
+                merge_clause = f"MERGE (n:{label} {{name: row.name}})"
+                match_clause = f"MATCH (n:{label} {{name: row.name}})"
+            else:
+                merge_clause = f"MERGE (n:{label} {{name: row.name, path: row.path, line_number: row.line_number}})"
+                match_clause = f"MATCH (n:{label} {{name: row.name, path: row.path, line_number: row.line_number}})"
+
+            # Rows in one UNWIND batch must share key set and value types
+            # (KuzuDB rejects heterogeneous row schemas), so batch per shape.
+            by_shape: Dict[Tuple, List[Dict[str, Any]]] = {}
+            for row in entity_rows:
+                shape = tuple(sorted((k, type(v).__name__) for k, v in row.items()))
+                by_shape.setdefault(shape, []).append(row)
+
+            for shape_rows in by_shape.values():
+                for chunk in _iter_chunks(shape_rows, batch_size):
+                    session.run(
+                        f"""
+                        UNWIND $batch AS row
+                        {merge_clause}
+                        SET n += row
+                    """,
+                        batch=chunk,
+                    )
+                    session.run(
+                        f"""
+                        UNWIND $batch AS row
+                        MATCH (f:File {{path: row.path}})
+                        {match_clause}
+                        MERGE (f)-[:CONTAINS]->(n)
+                    """,
+                        batch=chunk,
+                    )
+
+        if rows["params"]:
+            seen_params: set = set()
+            unique_params: List[Dict[str, Any]] = []
+            for p in rows["params"]:
+                key = (p["path"], p["func_name"], p["line_number"], p["arg_name"])
+                if key not in seen_params:
+                    seen_params.add(key)
+                    unique_params.append(p)
+            for chunk in _iter_chunks(unique_params, batch_size):
                 session.run(
                     """
                     UNWIND $batch AS row
-                    MATCH (fn:Function {name: row.func_name, path: $file_path, line_number: row.line_number})
-                    MERGE (p:Parameter {name: row.arg_name, path: $file_path, function_line_number: row.line_number})
-                    SET p.name = row.arg_name, p.path = $file_path, p.function_line_number = row.line_number
+                    MATCH (fn:Function {name: row.func_name, path: row.path, line_number: row.line_number})
+                    MERGE (p:Parameter {name: row.arg_name, path: row.path, function_line_number: row.line_number})
+                    SET p.name = row.arg_name, p.path = row.path, p.function_line_number = row.line_number
                     MERGE (fn)-[:HAS_PARAMETER]->(p)
                 """,
-                    batch=unique_params,
-                    file_path=file_path_str,
+                    batch=chunk,
                 )
 
-            if enum_member_batch:
-                for label in ("Class", "Enum"):
-                    try:
+        if rows["enum_members"]:
+            for label in ("Class", "Enum"):
+                try:
+                    for chunk in _iter_chunks(rows["enum_members"], batch_size):
                         session.run(
                             f"""
                             UNWIND $batch AS row
-                            MATCH (c:{label} {{name: row.class_name, path: $file_path}})
-                            MATCH (m:EnumMember {{name: row.member_name, path: $file_path}})
+                            MATCH (c:{label} {{name: row.class_name, path: row.path}})
+                            MATCH (m:EnumMember {{name: row.member_name, path: row.path}})
                             WHERE row.class_line < 0 OR c.line_number = row.class_line
                             MERGE (c)-[:CONTAINS]->(m)
                             """,
-                            batch=enum_member_batch,
-                            file_path=file_path_str,
+                            batch=chunk,
                         )
-                    except Exception as e:
-                        if _is_binder_exception(e):
-                            continue
-                        raise e
+                except Exception as e:
+                    if _is_binder_exception(e):
+                        continue
+                    raise e
 
-            if class_fn_batch:
-                for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
-                    try:
+        if rows["class_fns"]:
+            for label in ("Class", "Module", "Interface", "Struct", "Record", "Trait", "Object", "Mixin"):
+                try:
+                    for chunk in _iter_chunks(rows["class_fns"], batch_size):
                         session.run(
                             f"""
                             UNWIND $batch AS row
-                            MATCH (c:{label} {{name: row.class_name, path: $file_path}})
-                            MATCH (fn:Function {{name: row.func_name, path: $file_path, line_number: row.func_line}})
+                            MATCH (c:{label} {{name: row.class_name, path: row.path}})
+                            MATCH (fn:Function {{name: row.func_name, path: row.path, line_number: row.func_line}})
                             WHERE row.class_line < 0 OR c.line_number = row.class_line
                             MERGE (c)-[:CONTAINS]->(fn)
                             """,
-                            batch=class_fn_batch,
-                            file_path=file_path_str,
+                            batch=chunk,
                         )
-                    except Exception as e:
-                        if _is_binder_exception(e):
-                            continue
-                        raise e
-
-
-            if nested_fn_batch:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (outer:Function {name: row.outer, path: $file_path})
-                    MATCH (inner:Function {name: row.inner_name, path: $file_path, line_number: row.inner_line})
-                    MERGE (outer)-[:CONTAINS]->(inner)
-                """,
-                    batch=nested_fn_batch,
-                    file_path=file_path_str,
-                )
-
-            js_imports = []
-
-            other_imports = []
-            for imp in file_data.get("imports", []):
-                if lang in {"javascript", "typescript", "tsx"}:
-                    module_name = imp.get("source")
-                    if module_name:
-                        js_imports.append(
-                            {
-                                "module_name": module_name,
-                                "imported_name": imp.get("name", "*"),
-                                "alias": imp.get("alias") or "",
-                                "line_number": imp.get("line_number") or 0,
-                            }
-                        )
-                else:
-                    module_name = (
-                        imp.get("name")
-                        or imp.get("source")
-                        or imp.get("full_import_name")
-                    )
-                    if not module_name:
+                except Exception as e:
+                    if _is_binder_exception(e):
                         continue
-                    full_import_name = (
-                        imp.get("full_import_name")
-                        or imp.get("source")
-                        or module_name
-                    )
-                    other_imports.append(
-                        {
-                            "name": module_name,
-                            "full_import_name": full_import_name,
-                            "imported_name": imp.get("imported_name") or module_name,
-                            "alias": imp.get("alias"),
-                            "line_number": imp.get("line_number") or 0,
-                            "lang": imp.get("lang") or lang,
-                        }
-                    )
+                    raise e
 
-            if js_imports:
+        for chunk in _iter_chunks(rows["nested_fns"], batch_size):
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (outer:Function {name: row.outer, path: row.path})
+                MATCH (inner:Function {name: row.inner_name, path: row.path, line_number: row.inner_line})
+                MERGE (outer)-[:CONTAINS]->(inner)
+            """,
+                batch=chunk,
+            )
+
+        for chunk in _iter_chunks(rows["js_imports"], batch_size):
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (f:File {path: row.path})
+                MERGE (m:Module {name: row.module_name})
+                MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
+                SET r.imported_name = row.imported_name,
+                    r.alias = row.alias
+            """,
+                batch=chunk,
+            )
+
+        if rows["other_imports"]:
+            other_imports = sort_import_rows_for_metadata(rows["other_imports"])
+            for chunk in _iter_chunks(other_imports, batch_size):
                 session.run(
                     """
                     UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
-                    MERGE (m:Module {name: row.module_name})
-                    MERGE (f)-[r:IMPORTS {line_number: row.line_number}]->(m)
-                    SET r.imported_name = row.imported_name,
-                        r.alias = row.alias
-                """,
-                    batch=js_imports,
-                    file_path=file_path_str,
-                )
-
-            if other_imports:
-                other_imports = sort_import_rows_for_metadata(other_imports)
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (f:File {path: $file_path})
+                    MATCH (f:File {path: row.path})
                     MERGE (m:Module {name: row.name})
                     SET m.lang = coalesce(m.lang, row.lang),
                         m.full_import_name = coalesce(m.full_import_name, row.full_import_name)
@@ -567,26 +717,20 @@ class GraphWriter:
                         r.imported_name = row.imported_name,
                         r.full_import_name = row.full_import_name
                 """,
-                    batch=other_imports,
-                    file_path=file_path_str,
+                    batch=chunk,
                 )
 
-            module_inclusions = file_data.get("module_inclusions", [])
-            if module_inclusions:
-                session.run(
-                    """
-                    UNWIND $batch AS row
-                    MATCH (c:Class {name: row.class_name, path: $file_path})
-                    MERGE (m:Module {name: row.module_name})
-                    MERGE (c)-[:INCLUDES]->(m)
-                """,
-                    batch=[
-                        {"class_name": i["class"], "module_name": i["module"]} for i in module_inclusions
-                    ],
-                    file_path=file_path_str,
-                )
+        for chunk in _iter_chunks(rows["module_inclusions"], batch_size):
+            session.run(
+                """
+                UNWIND $batch AS row
+                MATCH (c:Class {name: row.class_name, path: row.path})
+                MERGE (m:Module {name: row.module_name})
+                MERGE (c)-[:INCLUDES]->(m)
+            """,
+                batch=chunk,
+            )
 
-        execute_write_operation(self.driver, backend, _work)
     def add_minimal_file_node(
         self, file_path: Path, repo_path: Path, is_dependency: bool = False
     ) -> None:
@@ -903,13 +1047,18 @@ class GraphWriter:
             _work(session)
         info_logger("[CALLS] All relationships processed.")
 
-    def _create_csharp_inheritance_and_interfaces(
-        self, session: Any, file_data: Dict[str, Any], imports_map: dict
-    ) -> None:
+    @staticmethod
+    def _collect_csharp_inheritance_rows(
+        file_data: Dict[str, Any],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """Return (implements_rows, inherits_rows) for a C# file's base types."""
+        implements_rows: List[Dict[str, Any]] = []
+        inherits_rows: List[Dict[str, Any]] = []
         if file_data.get("lang") != "c_sharp":
-            return
+            return implements_rows, inherits_rows
 
         caller_file_path = _normalize_path(file_data["path"])
+        interface_names = {iface["name"] for iface in file_data.get("interfaces", [])}
 
         for type_list_name, type_label in [
             ("classes", "Class"),
@@ -923,58 +1072,62 @@ class GraphWriter:
 
                 for base_str in type_item["bases"]:
                     base_name = base_str.split("<")[0].strip()
-
-                    is_interface = False
-
-                    for iface in file_data.get("interfaces", []):
-                        if iface["name"] == base_name:
-                            is_interface = True
-                            break
-
-                    if base_name in imports_map:
-                        possible_paths = imports_map[base_name]
-                        if len(possible_paths) > 0:
-                            pass
-
+                    is_interface = base_name in interface_names
                     base_index = type_item["bases"].index(base_str)
 
+                    row = {
+                        "child_name": type_item["name"],
+                        "path": caller_file_path,
+                        "base_name": base_name,
+                    }
                     if is_interface or (base_index > 0 and type_label == "Class"):
-                        for clab in ("Class", "Struct", "Record", "Mixin", "Extension"):
-                            try:
-                                session.run(
-                                    f"""
-                                    MATCH (child:`{clab}` {{name: $child_name, path: $path}})
-                                    MATCH (iface:Interface {{name: $interface_name}})
-                                    MERGE (child)-[:IMPLEMENTS]->(iface)
-                                """,
-                                    child_name=type_item["name"],
-                                    path=caller_file_path,
-                                    interface_name=base_name,
-                                )
-                            except Exception as e:
-                                if _is_binder_exception(e):
-                                    continue
-                                raise e
+                        implements_rows.append(row)
                     else:
-                        child_labels = ("Class", "Record", "Interface", "Mixin", "Extension")
-                        parent_labels = ("Class", "Record", "Interface", "Mixin", "Extension")
-                        for clab in child_labels:
-                            for plab in parent_labels:
-                                try:
-                                    session.run(
-                                        f"""
-                                        MATCH (child:`{clab}` {{name: $child_name, path: $path}})
-                                        MATCH (parent:`{plab}` {{name: $parent_name}})
-                                        MERGE (child)-[:INHERITS]->(parent)
-                                    """,
-                                        child_name=type_item["name"],
-                                        path=caller_file_path,
-                                        parent_name=base_name,
-                                    )
-                                except Exception as e:
-                                    if _is_binder_exception(e):
-                                        continue
-                                    raise e
+                        inherits_rows.append(row)
+
+        return implements_rows, inherits_rows
+
+    def _write_csharp_inheritance_rows(
+        self,
+        session: Any,
+        implements_rows: List[Dict[str, Any]],
+        inherits_rows: List[Dict[str, Any]],
+    ) -> None:
+        for clab in ("Class", "Struct", "Record", "Mixin", "Extension"):
+            try:
+                for chunk in _iter_chunks(implements_rows, 1000):
+                    session.run(
+                        f"""
+                        UNWIND $batch AS row
+                        MATCH (child:`{clab}` {{name: row.child_name, path: row.path}})
+                        MATCH (iface:Interface {{name: row.base_name}})
+                        MERGE (child)-[:IMPLEMENTS]->(iface)
+                    """,
+                        batch=chunk,
+                    )
+            except Exception as e:
+                if _is_binder_exception(e):
+                    continue
+                raise e
+
+        labels = ("Class", "Record", "Interface", "Mixin", "Extension")
+        for clab in labels:
+            for plab in labels:
+                try:
+                    for chunk in _iter_chunks(inherits_rows, 1000):
+                        session.run(
+                            f"""
+                            UNWIND $batch AS row
+                            MATCH (child:`{clab}` {{name: row.child_name, path: row.path}})
+                            MATCH (parent:`{plab}` {{name: row.base_name}})
+                            MERGE (child)-[:INHERITS]->(parent)
+                        """,
+                            batch=chunk,
+                        )
+                except Exception as e:
+                    if _is_binder_exception(e):
+                        continue
+                    raise e
 
 
     def write_inheritance_links(
@@ -1032,8 +1185,13 @@ class GraphWriter:
                     raise e
 
 
+            csharp_implements: List[Dict[str, Any]] = []
+            csharp_inherits: List[Dict[str, Any]] = []
             for file_data in csharp_files:
-                self._create_csharp_inheritance_and_interfaces(session, file_data, imports_map)
+                impl_rows, inh_rows = self._collect_csharp_inheritance_rows(file_data)
+                csharp_implements.extend(impl_rows)
+                csharp_inherits.extend(inh_rows)
+            self._write_csharp_inheritance_rows(session, csharp_implements, csharp_inherits)
 
         execute_write_operation(self.driver, backend, _work)
         info_logger(f"[INHERITS] Complete: {len(inheritance_batch)} inheritance links processed.")
@@ -1044,24 +1202,34 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for row in implements_batch:
+            child_label = _cypher_label(row.get("child_label", "Struct"), backend)
+            parent_label = _cypher_label(row.get("parent_label", "Interface"), backend)
+            grouped.setdefault((child_label, parent_label), []).append(
+                {
+                    "child_name": row["child_name"],
+                    "path": row["path"],
+                    "parent_name": row["parent_name"],
+                    "resolved_parent_file_path": row["resolved_parent_file_path"],
+                    "confidence_label": row.get("confidence_label", "INFERRED"),
+                }
+            )
+
         def _work(session):
-            for row in implements_batch:
-                child_label = _cypher_label(row.get("child_label", "Struct"), backend)
-                parent_label = _cypher_label(row.get("parent_label", "Interface"), backend)
+            for (child_label, parent_label), rows in grouped.items():
                 try:
-                    session.run(
-                        f"""
-                        MATCH (child:{child_label} {{name: $child_name, path: $path}})
-                        MATCH (parent:{parent_label} {{name: $parent_name, path: $resolved_parent_file_path}})
-                        MERGE (child)-[r:IMPLEMENTS]->(parent)
-                        SET r.confidence_label = coalesce($confidence_label, 'INFERRED')
-                        """,
-                        child_name=row["child_name"],
-                        path=row["path"],
-                        parent_name=row["parent_name"],
-                        resolved_parent_file_path=row["resolved_parent_file_path"],
-                        confidence_label=row.get("confidence_label", "INFERRED"),
-                    )
+                    for chunk in _iter_chunks(rows, 1000):
+                        session.run(
+                            f"""
+                            UNWIND $batch AS row
+                            MATCH (child:{child_label} {{name: row.child_name, path: row.path}})
+                            MATCH (parent:{parent_label} {{name: row.parent_name, path: row.resolved_parent_file_path}})
+                            MERGE (child)-[r:IMPLEMENTS]->(parent)
+                            SET r.confidence_label = coalesce(row.confidence_label, 'INFERRED')
+                            """,
+                            batch=chunk,
+                        )
                 except Exception as e:
                     if _is_binder_exception(e):
                         continue
@@ -1076,24 +1244,34 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        grouped: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        for row in partial_of_batch:
+            child_label = _cypher_label(row.get("child_label", "Class"), backend)
+            parent_label = _cypher_label(row.get("parent_label", "Class"), backend)
+            grouped.setdefault((child_label, parent_label), []).append(
+                {
+                    "child_name": row["child_name"],
+                    "path": row["path"],
+                    "parent_name": row["parent_name"],
+                    "resolved_parent_file_path": row["resolved_parent_file_path"],
+                    "confidence_label": row.get("confidence_label", "INFERRED"),
+                }
+            )
+
         def _work(session):
-            for row in partial_of_batch:
-                child_label = _cypher_label(row.get("child_label", "Class"), backend)
-                parent_label = _cypher_label(row.get("parent_label", "Class"), backend)
+            for (child_label, parent_label), rows in grouped.items():
                 try:
-                    session.run(
-                        f"""
-                        MATCH (child:{child_label} {{name: $child_name, path: $path}})
-                        MATCH (parent:{parent_label} {{name: $parent_name, path: $resolved_parent_file_path}})
-                        MERGE (child)-[r:PARTIAL_OF]->(parent)
-                        SET r.confidence_label = coalesce($confidence_label, 'INFERRED')
-                        """,
-                        child_name=row["child_name"],
-                        path=row["path"],
-                        parent_name=row["parent_name"],
-                        resolved_parent_file_path=row["resolved_parent_file_path"],
-                        confidence_label=row.get("confidence_label", "INFERRED"),
-                    )
+                    for chunk in _iter_chunks(rows, 1000):
+                        session.run(
+                            f"""
+                            UNWIND $batch AS row
+                            MATCH (child:{child_label} {{name: row.child_name, path: row.path}})
+                            MATCH (parent:{parent_label} {{name: row.parent_name, path: row.resolved_parent_file_path}})
+                            MERGE (child)-[r:PARTIAL_OF]->(parent)
+                            SET r.confidence_label = coalesce(row.confidence_label, 'INFERRED')
+                            """,
+                            batch=chunk,
+                        )
                 except Exception as e:
                     if _is_binder_exception(e):
                         continue
@@ -1109,20 +1287,22 @@ class GraphWriter:
         backend = get_backend_type(self.driver, self._db_manager)
 
         def _work(session):
-            for row in part_of_batch:
-                try:
+            try:
+                for chunk in _iter_chunks(part_of_batch, 1000):
                     session.run(
                         """
-                        MATCH (child:File {path: $child_path})
-                        MATCH (parent:File {path: $parent_path})
+                        UNWIND $batch AS row
+                        MATCH (child:File {path: row.child_path})
+                        MATCH (parent:File {path: row.parent_path})
                         MERGE (child)-[r:PART_OF]->(parent)
                         """,
-                        child_path=row["child_path"],
-                        parent_path=row["parent_path"],
+                        batch=[
+                            {"child_path": r["child_path"], "parent_path": r["parent_path"]}
+                            for r in chunk
+                        ],
                     )
-                except Exception as e:
-                    if _is_binder_exception(e):
-                        continue
+            except Exception as e:
+                if not _is_binder_exception(e):
                     raise e
 
         execute_write_operation(self.driver, backend, _work)
@@ -1134,35 +1314,42 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        rows = [
+            {
+                "decorated_name": row["decorated_name"],
+                "decorated_path": row["decorated_path"],
+                "decorated_line": row["decorated_line"],
+                "decorated_context": row.get("decorated_context", ""),
+                "decorator_name": row["decorator_name"],
+                "decorator_path": row["decorator_path"],
+                "line_number": row.get("line_number", row["decorated_line"]),
+            }
+            for row in decorated_by_batch
+        ]
+
         def _work(session):
-            for row in decorated_by_batch:
-                try:
+            try:
+                for chunk in _iter_chunks(rows, 1000):
                     session.run(
                         """
+                        UNWIND $batch AS row
                         MATCH (decorated:Function {
-                            name: $decorated_name,
-                            path: $decorated_path,
-                            line_number: $decorated_line
+                            name: row.decorated_name,
+                            path: row.decorated_path,
+                            line_number: row.decorated_line
                         })
-                        WHERE $decorated_context = "" OR decorated.context = $decorated_context
+                        WHERE row.decorated_context = "" OR decorated.context = row.decorated_context
                         MATCH (decorator:Function {
-                            name: $decorator_name,
-                            path: $decorator_path
+                            name: row.decorator_name,
+                            path: row.decorator_path
                         })
                         MERGE (decorated)-[r:DECORATED_BY]->(decorator)
-                        SET r.line_number = $line_number
+                        SET r.line_number = row.line_number
                         """,
-                        decorated_name=row["decorated_name"],
-                        decorated_path=row["decorated_path"],
-                        decorated_line=row["decorated_line"],
-                        decorated_context=row.get("decorated_context", ""),
-                        decorator_name=row["decorator_name"],
-                        decorator_path=row["decorator_path"],
-                        line_number=row.get("line_number", row["decorated_line"]),
+                        batch=chunk,
                     )
-                except Exception as e:
-                    if _is_binder_exception(e):
-                        continue
+            except Exception as e:
+                if not _is_binder_exception(e):
                     raise e
 
         execute_write_operation(self.driver, backend, _work)
@@ -1174,27 +1361,34 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        rows = [
+            {
+                "child_name": row["child_name"],
+                "path": row["path"],
+                "parent_name": row["parent_name"],
+                "resolved_parent_file_path": row["resolved_parent_file_path"],
+                "line_number": row.get("line_number", 0),
+                "confidence_label": row.get("confidence_label", "EXTRACTED"),
+            }
+            for row in metaclass_batch
+        ]
+
         def _work(session):
-            for row in metaclass_batch:
-                try:
+            try:
+                for chunk in _iter_chunks(rows, 1000):
                     session.run(
                         """
-                        MATCH (child:Class {name: $child_name, path: $path})
-                        MATCH (parent:Class {name: $parent_name, path: $resolved_parent_file_path})
+                        UNWIND $batch AS row
+                        MATCH (child:Class {name: row.child_name, path: row.path})
+                        MATCH (parent:Class {name: row.parent_name, path: row.resolved_parent_file_path})
                         MERGE (child)-[r:METACLASS]->(parent)
-                        SET r.line_number = $line_number
-                        SET r.confidence_label = coalesce($confidence_label, 'EXTRACTED')
+                        SET r.line_number = row.line_number
+                        SET r.confidence_label = coalesce(row.confidence_label, 'EXTRACTED')
                         """,
-                        child_name=row["child_name"],
-                        path=row["path"],
-                        parent_name=row["parent_name"],
-                        resolved_parent_file_path=row["resolved_parent_file_path"],
-                        line_number=row.get("line_number", 0),
-                        confidence_label=row.get("confidence_label", "EXTRACTED"),
+                        batch=chunk,
                     )
-                except Exception as e:
-                    if _is_binder_exception(e):
-                        continue
+            except Exception as e:
+                if not _is_binder_exception(e):
                     raise e
 
         execute_write_operation(self.driver, backend, _work)
@@ -1206,33 +1400,40 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        rows = [
+            {
+                "companion_name": row["companion_name"],
+                "companion_path": row["companion_path"],
+                "companion_line": row["companion_line"],
+                "owner_name": row["owner_name"],
+                "owner_path": row["owner_path"],
+                "owner_line": row["owner_line"],
+            }
+            for row in companion_batch
+        ]
+
         def _work(session):
-            for row in companion_batch:
-                try:
+            try:
+                for chunk in _iter_chunks(rows, 1000):
                     session.run(
                         """
+                        UNWIND $batch AS row
                         MATCH (companion:Object {
-                            name: $companion_name,
-                            path: $companion_path,
-                            line_number: $companion_line
+                            name: row.companion_name,
+                            path: row.companion_path,
+                            line_number: row.companion_line
                         })
                         MATCH (owner:Class {
-                            name: $owner_name,
-                            path: $owner_path,
-                            line_number: $owner_line
+                            name: row.owner_name,
+                            path: row.owner_path,
+                            line_number: row.owner_line
                         })
                         MERGE (companion)-[r:COMPANION_OF]->(owner)
                         """,
-                        companion_name=row["companion_name"],
-                        companion_path=row["companion_path"],
-                        companion_line=row["companion_line"],
-                        owner_name=row["owner_name"],
-                        owner_path=row["owner_path"],
-                        owner_line=row["owner_line"],
+                        batch=chunk,
                     )
-                except Exception as e:
-                    if _is_binder_exception(e):
-                        continue
+            except Exception as e:
+                if not _is_binder_exception(e):
                     raise e
 
         execute_write_operation(self.driver, backend, _work)
@@ -1244,25 +1445,32 @@ class GraphWriter:
 
         backend = get_backend_type(self.driver, self._db_manager)
 
+        rows = [
+            {
+                "child_name": row["child_name"],
+                "path": row["path"],
+                "parent_name": row["parent_name"],
+                "resolved_parent_file_path": row["resolved_parent_file_path"],
+                "line_number": row.get("line_number", 0),
+            }
+            for row in embeds_batch
+        ]
+
         def _work(session):
-            for row in embeds_batch:
-                try:
+            try:
+                for chunk in _iter_chunks(rows, 1000):
                     session.run(
                         """
-                        MATCH (child:Struct {name: $child_name, path: $path})
-                        MATCH (parent:Struct {name: $parent_name, path: $resolved_parent_file_path})
+                        UNWIND $batch AS row
+                        MATCH (child:Struct {name: row.child_name, path: row.path})
+                        MATCH (parent:Struct {name: row.parent_name, path: row.resolved_parent_file_path})
                         MERGE (child)-[r:EMBEDS]->(parent)
-                        SET r.line_number = $line_number
+                        SET r.line_number = row.line_number
                         """,
-                        child_name=row["child_name"],
-                        path=row["path"],
-                        parent_name=row["parent_name"],
-                        resolved_parent_file_path=row["resolved_parent_file_path"],
-                        line_number=row.get("line_number", 0),
+                        batch=chunk,
                     )
-                except Exception as e:
-                    if _is_binder_exception(e):
-                        continue
+            except Exception as e:
+                if not _is_binder_exception(e):
                     raise e
 
         execute_write_operation(self.driver, backend, _work)
@@ -1271,47 +1479,69 @@ class GraphWriter:
     def write_scip_call_edges(
         self, files_data: Dict[str, Any], name_from_symbol: Callable[[str], str]
     ) -> None:
+        batch_size = 1000
+        caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
+        callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
+
+        fn_edges: List[Dict[str, Any]] = []
+        module_edges: List[Dict[str, Any]] = []
+        for file_data in files_data.values():
+            for edge in file_data.get("function_calls_scip", []):
+                fn_edges.append(
+                    {
+                        "caller_name": name_from_symbol(edge["caller_symbol"]),
+                        "caller_file": edge["caller_file"],
+                        "caller_line": edge["caller_line"],
+                        "callee_name": edge["callee_name"],
+                        "callee_file": edge["callee_file"],
+                        "ref_line": edge["ref_line"],
+                    }
+                )
+            for edge in file_data.get("module_level_calls_scip", []):
+                module_edges.append(
+                    {
+                        "caller_file": edge["caller_file"],
+                        "callee_name": edge["callee_name"],
+                        "callee_file": edge["callee_file"],
+                        "ref_line": edge["ref_line"],
+                    }
+                )
+
+        if not fn_edges and not module_edges:
+            return
+
         backend = get_backend_type(self.driver, self._db_manager)
         def _work(session):
-            for file_data in files_data.values():
-                caller_labels = ("Function", "Variable", "Class", "Interface", "Trait", "Struct", "Record", "Union", "Mixin", "Extension")
-                callee_labels = ("Function", "Class", "Interface", "Trait", "Struct", "Enum", "Record", "Union", "Mixin", "Extension")
-                for edge in file_data.get("function_calls_scip", []):
-                    for clab in caller_labels:
-                        for calab in callee_labels:
-                            try:
-                                session.run(
-                                    f"""
-                                    MATCH (caller:`{clab}` {{name: $caller_name, path: $caller_file, line_number: $caller_line}})
-                                    MATCH (callee:`{calab}` {{name: $callee_name, path: $callee_file}})
-                                    MERGE (caller)-[:CALLS {{line_number: $ref_line, source: 'scip'}}]->(callee)
-                                """,
-                                    caller_name=name_from_symbol(edge["caller_symbol"]),
-                                    caller_file=edge["caller_file"],
-                                    caller_line=edge["caller_line"],
-                                    callee_name=edge["callee_name"],
-                                    callee_file=edge["callee_file"],
-                                    ref_line=edge["ref_line"],
-                                )
-                            except Exception as e:
-                                warning_logger(f"Failed to write SCIP call edge: {e}")
-
-                for edge in file_data.get("module_level_calls_scip", []):
-                    for calab in callee_labels:
-                        try:
+            for clab in caller_labels:
+                for calab in callee_labels:
+                    try:
+                        for chunk in _iter_chunks(fn_edges, batch_size):
                             session.run(
                                 f"""
-                                MATCH (caller:File {{path: $caller_file}})
-                                MATCH (callee:`{calab}` {{name: $callee_name, path: $callee_file}})
-                                MERGE (caller)-[:CALLS {{line_number: $ref_line, source: 'scip'}}]->(callee)
+                                UNWIND $batch AS row
+                                MATCH (caller:`{clab}` {{name: row.caller_name, path: row.caller_file, line_number: row.caller_line}})
+                                MATCH (callee:`{calab}` {{name: row.callee_name, path: row.callee_file}})
+                                MERGE (caller)-[:CALLS {{line_number: row.ref_line, source: 'scip'}}]->(callee)
                             """,
-                                caller_file=edge["caller_file"],
-                                callee_name=edge["callee_name"],
-                                callee_file=edge["callee_file"],
-                                ref_line=edge["ref_line"],
+                                batch=chunk,
                             )
-                        except Exception as e:
-                            warning_logger(f"Failed to write SCIP module-level call edge: {e}")
+                    except Exception as e:
+                        warning_logger(f"Failed to write SCIP call edges ({clab}->{calab}): {e}")
+
+            for calab in callee_labels:
+                try:
+                    for chunk in _iter_chunks(module_edges, batch_size):
+                        session.run(
+                            f"""
+                            UNWIND $batch AS row
+                            MATCH (caller:File {{path: row.caller_file}})
+                            MATCH (callee:`{calab}` {{name: row.callee_name, path: row.callee_file}})
+                            MERGE (caller)-[:CALLS {{line_number: row.ref_line, source: 'scip'}}]->(callee)
+                        """,
+                            batch=chunk,
+                        )
+                except Exception as e:
+                    warning_logger(f"Failed to write SCIP module-level call edges (File->{calab}): {e}")
 
         execute_write_operation(self.driver, backend, _work)
     def delete_file_from_graph(self, path: str) -> None:

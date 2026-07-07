@@ -73,6 +73,9 @@ DEFAULT_CONFIG = {
     "SCIP_INDEXER": "false",
     "SCIP_LANGUAGES": "python,typescript,javascript,go,rust,java,dart,cpp,c,csharp",
     "SKIP_EXTERNAL_RESOLUTION": "false",
+    # Batched graph writes: rows per UNWIND query / files collected per flush group
+    "WRITE_BATCH_SIZE": "1000",
+    "WRITE_FILE_GROUP_SIZE": "200",
     # 0 = unlimited; any positive integer caps MCP tool response size.
     "MAX_TOOL_RESPONSE_TOKENS": "0",
     # JSON object mapping tool names to integer result-count limits.
@@ -114,6 +117,8 @@ CONFIG_DESCRIPTIONS = {
     "SCIP_INDEXER": "Use SCIP-based indexing for higher accuracy call/inheritance resolution (requires scip-<lang> tools installed)",
     "SCIP_LANGUAGES": "Comma-separated languages to index via SCIP when SCIP_INDEXER=true (python,typescript,javascript,go,rust,java,dart,cpp,c,csharp)",
     "SKIP_EXTERNAL_RESOLUTION": "Skip resolution attempts for external library method calls (recommended for enterprise large Java/Spring codebases)",
+    "WRITE_BATCH_SIZE": "Rows per UNWIND query when writing file/symbol nodes",
+    "WRITE_FILE_GROUP_SIZE": "Files collected per flush group (bounds memory and transaction size)",
     "MAX_TOOL_RESPONSE_TOKENS": "Maximum tokens per MCP tool response (0 = unlimited). Truncates oversized payloads and appends a notice.",
     "TOOL_RESULT_LIMITS": "JSON object mapping tool names to max result counts, e.g. {\"find_code\": 20, \"analyze_code_relationships\": 10}. Missing keys use built-in defaults.",
     # Post-indexing resolution phases
