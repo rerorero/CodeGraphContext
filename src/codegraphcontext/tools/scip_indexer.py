@@ -533,9 +533,13 @@ class ScipIndexParser:
                     symbol_def_table[sym_info.symbol]["kind"] = sym_info.kind
                     
                     bases = []
-                    for rel in sym_info.relationships:
-                        if rel.is_implementation:
-                            bases.append(rel.symbol)
+                    # scip-go は method 単位まで含む大量の implementation 関係を出す
+                    # (layerone 実測 460k)。inheritance pass がラベルペア展開で行数爆発し
+                    # OOM するため、環境変数で取り込みを opt-out できるようにする。
+                    if os.getenv("CGC_SKIP_IMPLEMENTATION_BASES", "").lower() not in ("1", "true"):
+                        for rel in sym_info.relationships:
+                            if rel.is_implementation:
+                                bases.append(rel.symbol)
                     symbol_def_table[sym_info.symbol]["bases"] = bases
 
         for sym_info in index.external_symbols:
