@@ -171,6 +171,14 @@ def get_database_manager(db_path: Optional[str] = None) -> Union['DatabaseManage
                 info_logger(f"Using FalkorDB Lite (explicit) at {db_path or 'default path'}")
                 return mgr
             except FalkorDBUnavailableError as falkor_err:
+                # Silent backend fallback writes the index into a DIFFERENT database
+                # than the one queries read from — hours of work lost with exit 0.
+                # Allow opting into a hard failure instead.
+                if os.getenv("CGC_NO_DB_FALLBACK", "").lower() in ("1", "true"):
+                    raise RuntimeError(
+                        f"FalkorDB Lite unavailable ({falkor_err}) and "
+                        "CGC_NO_DB_FALLBACK is set — refusing silent backend fallback."
+                    ) from falkor_err
                 mark_falkordb_unavailable()
                 info_logger(f"FalkorDB Lite not functional ({falkor_err}). Falling back to available backend.")
                 if _is_kuzudb_available():
