@@ -82,10 +82,11 @@ class FalkorDBManager:
     _graph = None
     _lock = threading.Lock()
     _startup_failed = False
-    _STARTUP_TIMEOUT_SEC = int(os.getenv("CGC_DB_STARTUP_TIMEOUT_SEC", "180"))
-    # 大きい RDB (数百MB) のロードは "Redis is loading the dataset in memory" で
-    # 数十秒かかる。短い既定値だと起動中に timeout し、silent fallback や
-    # CGC_NO_DB_FALLBACK のハードエラーを誤発動させる。
+    _STARTUP_TIMEOUT_SEC = 5
+    # Redis が "loading the dataset in memory" を返している間は「起動失敗」ではなく
+    # 「起動進行中」。RDB サイズに比例して数十秒かかるため、LOADING の間だけ
+    # 待ち時間を延長する（それ以外の失敗は従来どおり 5 秒で見切る）。
+    _LOADING_TIMEOUT_SEC = int(os.getenv("CGC_DB_LOADING_TIMEOUT_SEC", "300"))
 
     def __new__(cls, *args, **kwargs):
         """Standard singleton pattern implementation."""
@@ -360,6 +361,9 @@ class FalkorDBManager:
                     ) from ve
                 except Exception as e:
                     last_error = e
+                    if "loading the dataset" in str(e).lower():
+                        # データセットロード中 = 正常な起動進行。期限を延長する。
+                        timeout = max(timeout, self._LOADING_TIMEOUT_SEC)
             
             # Check if process died
             if self._process.poll() is not None:
